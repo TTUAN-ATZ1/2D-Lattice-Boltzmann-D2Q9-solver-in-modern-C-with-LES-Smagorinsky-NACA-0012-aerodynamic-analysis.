@@ -2,6 +2,8 @@
 #include <cmath>
 #include "geometry_naca.hpp"
 #include <algorithm>
+#include <stdexcept>
+#include <limits>
 
 namespace lbm
 {
@@ -14,10 +16,11 @@ namespace lbm
 
     void NACAGeometry::build_profile()
     {
+        if (!std::isfinite(chord)||chord<=0||!std::isfinite(alpha_deg)
+            ||!std::isfinite(x_pivot)||!std::isfinite(y_pivot)||Nb<8||Nb%2!=0)
+            throw std::invalid_argument("Geometry requires positive chord, finite coordinates and an even point count >= 8");
         surface_points.clear();
         raw_points.clear();
-        ds.clear();
-        normal.clear();
 
         int n_half = (Nb / 2) + 1; // 61 diem
         std::vector<double> xc(n_half);
@@ -28,10 +31,11 @@ namespace lbm
         {
             double beta = M_PI * i / (n_half - 1);
             xc[i] = 0.5 * chord * (1.0 - std::cos(beta));
-            double x_rel = std::max(xc[i] / chord, 1e-6);
+            double x_rel = xc[i] / chord;
 
             // Khep kin mep sau
             yt[i] = 5.0 * 0.12 * chord * (0.2969 * std::sqrt(x_rel) - 0.1260 * x_rel - 0.3516 * (x_rel * x_rel) + 0.2843 * (x_rel * x_rel * x_rel) - 0.1036 * (x_rel * x_rel * x_rel * x_rel));
+            if (i==0 || i==n_half-1) yt[i]=0.0;
         }
 
         // di theo chieu CGW: mep duoi -> lung canh ->mui -> bung canh
@@ -65,22 +69,6 @@ namespace lbm
             double y_rot = y_pivot - dx * sin_a + dy * cos_a;
             surface_points.push_back({x_rot, y_rot});
         }
-
-        // vector phap tuyen ngoai chuan tac n = (dy/ds, -dx/ds)
-        size_t N = surface_points.size();
-        ds.resize(N);
-        normal.resize(N);
-
-        for (size_t k = 0; k < N; ++k)
-        {
-            size_t k_next = (k + 1) % N;
-            double dx_seg = surface_points[k_next].x - surface_points[k].x;
-            double dy_seg = surface_points[k_next].y - surface_points[k].y;
-            double len = std::sqrt(dx_seg * dx_seg + dy_seg * dy_seg);
-            ds[k] = len;
-            normal[k].x = dy_seg / (len + 1e-12);
-            normal[k].y = -dx_seg / (len + 1e-12);
-        }
     }
 
     double NACAGeometry::distance_to_segment(double px, double py, double ax, double ay, double bx, double by)
@@ -104,6 +92,11 @@ namespace lbm
 
     void NACAGeometry::classify_grid(int nx, int ny, std::vector<NodeType> &node_type, std::vector<double> &wall_dist) const
     {
+        if (nx<3 || ny<3 || static_cast<long long>(nx)*ny>std::numeric_limits<int>::max())
+            throw std::invalid_argument("Invalid geometry grid dimensions");
+        for (const auto& p:surface_points)
+            if (p.x<2 || p.x>nx-3 || p.y<2 || p.y>ny-3)
+                throw std::invalid_argument("Airfoil must remain at least two cells inside the domain");
         int total = nx * ny;
         node_type.assign(total, NODE_FLUID);
         wall_dist.assign(total, 1e6);
@@ -140,7 +133,7 @@ namespace lbm
                     // Ray casting theo tia nằm ngang sang phải
                     if ((ay > py) != (by > py))
                     {
-                        double x_intersect = (bx - ax) * (py - ay) / (by - ay + 1e-12) + ax;
+                        double x_intersect = (bx - ax) * (py - ay) / (by - ay) + ax;
                         if (px < x_intersect)
                         {
                             cross_count++;
@@ -149,7 +142,7 @@ namespace lbm
                 }
 
                 wall_dist[n_idx] = d_min;
-                if (cross_count % 2 == 1)
+                if (cross_count % 2 == 1 || d_min<1e-10)
                 {
                     node_type[n_idx] = NODE_SOLID;
                 }
@@ -157,13 +150,14 @@ namespace lbm
         }
 
 // Xác định các nút BOUNDARY (FLUID tiếp giáp với SOLID) cho thuật toán MEA
+        const auto classified = node_type; // immutable input: avoid parallel neighbor read/write race
 #pragma omp parallel for
         for (int j = 1; j < ny - 1; ++j)
         {
             for (int i = 1; i < nx - 1; ++i)
             {
                 int n_idx = j * nx + i;
-                if (node_type[n_idx] == NODE_FLUID)
+                if (classified[n_idx] == NODE_FLUID)
                 {
                     bool near_solid = false;
                     for (int d = 1; d < Q; ++d)
@@ -171,7 +165,7 @@ namespace lbm
                         int ni = i + EX[d];
                         int nj = j + EY[d];
                         int neighbor_idx = nj * nx + ni;
-                        if (node_type[neighbor_idx] == NODE_SOLID)
+                        if (classified[neighbor_idx] == NODE_SOLID)
                         {
                             near_solid = true;
                             break;

@@ -1,26 +1,25 @@
 #include "momentum_exchange.hpp"
 #include <cmath>
+#include <algorithm>
 
 namespace lbm
 {
 
-    MomentumExchange::MomentumExchange(double chord, double u_inf, double Re, double xp, double yp)
-        : chord_lb(chord), x_pivot(xp), y_pivot(yp)
+    MomentumExchange::MomentumExchange(double chord, double u_inf, double xp, double yp)
+        : chord_lb(chord), x_pivot(xp), y_pivot(yp), current_alpha_rad(0.0)
     {
-
-        // Áp suất động LBM: q = 0.5 * rho * u^2 * chord
         q_dyn_lb = 0.5 * 1.0 * (u_inf * u_inf) * chord_lb;
-
-        // Lực cản ma sát Blasius 2 mặt ở Re = 100,000
-        Cd_friction = 2.0 * (1.328 / std::sqrt(Re));
+        if (!std::isfinite(q_dyn_lb) || q_dyn_lb<=0)
+            throw std::invalid_argument("Invalid MEA normalization");
     }
 
-    void MomentumExchange::build_boundary_links(int nx, int ny, const std::vector<NodeType> &node_type, double alpha_deg)
+    void MomentumExchange::build_boundary_links(int nx, int ny, const std::vector<NodeType> &node_type, const NACAGeometry &geom)
     {
         links.clear();
-        current_alpha_rad = alpha_deg * 3.14159265358979323846 / 180.0;
-        double cos_a = std::cos(current_alpha_rad);
-        double sin_a = std::sin(current_alpha_rad);
+        if (node_type.size()!=static_cast<size_t>(nx)*ny)
+            throw std::invalid_argument("MEA mask size mismatch");
+        current_alpha_rad = geom.alpha_deg * PI / 180.0;
+        const size_t N = geom.surface_points.size();
 
         for (int j = 1; j < ny - 1; ++j)
         {
@@ -35,7 +34,6 @@ namespace lbm
                         int nj = j + EY[d];
                         int neighbor_idx = nj * nx + ni;
 
-                        // Nếu hướng d đâm vào nút rắn SOLID
                         if (node_type[neighbor_idx] == NODE_SOLID)
                         {
                             BoundaryLink link;
@@ -44,16 +42,39 @@ namespace lbm
                             link.dir = d;
                             link.opp_dir = OPP[d];
 
-                            // Trung điểm của liên kết làm điểm đặt lực
-                            double mid_x = i + 0.5 * EX[d];
-                            double mid_y = j + 0.5 * EY[d];
-                            link.rx = mid_x - x_pivot;
-                            link.ry = mid_y - y_pivot;
+                            int ffx = i - EX[d];
+                            int ffy = j - EY[d];
+                            link.ff_x = ffx;
+                            link.ff_y = ffy;
+                            link.has_ff = (ffx >= 0 && ffx < nx && ffy >= 0 && ffy < ny
+                                           && node_type[ffy * nx + ffx] != NODE_SOLID);
 
-                            // Chiếu ngược về hệ tọa độ cánh để lấy tọa độ dọc dây cung từ LE
-                            double dx_chord = link.rx * cos_a - link.ry * sin_a;
-                            link.x_chord = 0.25 * chord_lb + dx_chord;
-
+                            // Tìm tỷ lệ khoảng cách thực q in (0, 1] từ nút chất lưu (i, j) đến đa giác cánh
+                            double q_min = 2.0;
+                            const double ex = EX[d];
+                            const double ey = EY[d];
+                            for (size_t k = 0; k < N; ++k)
+                            {
+                                const auto &a = geom.surface_points[k];
+                                const auto &b = geom.surface_points[(k + 1) % N];
+                                const double vx = b.x - a.x;
+                                const double vy = b.y - a.y;
+                                const double wx = a.x - i;
+                                const double wy = a.y - j;
+                                const double denom = ex * vy - ey * vx;
+                                if (std::abs(denom) > 1e-14)
+                                {
+                                    const double q_val = (wx * vy - wy * vx) / denom;
+                                    const double s_val = (wx * ey - wy * ex) / denom;
+                                    if (s_val >= -1e-9 && s_val <= 1.0 + 1e-9 && q_val >= -1e-9 && q_val <= 1.0 + 1e-9)
+                                    {
+                                        q_min = std::min(q_min, std::clamp(q_val, 1e-4, 1.0));
+                                    }
+                                }
+                            }
+                            link.q = (q_min <= 1.0) ? q_min : 0.5;
+                            link.rx = (i + link.q * ex) - x_pivot;
+                            link.ry = (j + link.q * ey) - y_pivot;
                             links.push_back(link);
                         }
                     }
@@ -62,65 +83,43 @@ namespace lbm
         }
     }
 
-    AeroForce MomentumExchange::compute_force(const Grid2D &grid) const
+    void MomentumExchange::build_boundary_links(int nx, int ny, const std::vector<NodeType> &node_type, double alpha_deg)
+    {
+        NACAGeometry geom(chord_lb, alpha_deg, x_pivot, y_pivot);
+        build_boundary_links(nx, ny, node_type, geom);
+    }
+
+    AeroForce MomentumExchange::compute_force(const Grid2D &grid, bool is_post_collision) const
     {
         double total_Fx = 0.0;
         double total_Fy = 0.0;
         double total_Mz = 0.0;
-        double total_Fn = 0.0;
-        double moment_chord = 0.0;
-
-        double cos_a = std::cos(current_alpha_rad);
-        double sin_a = std::sin(current_alpha_rad);
 
         int num_links = static_cast<int>(links.size());
 
-#pragma omp parallel for reduction(+ : total_Fx, total_Fy, total_Mz, total_Fn, moment_chord)
+#pragma omp parallel for reduction(+ : total_Fx, total_Fy, total_Mz)
         for (int k = 0; k < num_links; ++k)
         {
             const auto &link = links[k];
             int n_idx = grid.idx(link.x, link.y);
 
-            // Với vách tĩnh half-way bounce-back: f_bar(x_f, t+1) = f_i^*(x_f, t)
-            // Lực tác dụng lên vách: F = 2 * c_i * f_out
-            double f_out = grid.f[link.opp_dir][n_idx];
-            double momentum_transfer = 2.0 * f_out;
+            // Trước swap (is_post_collision = true): f_in nằm ở f[dir], f_out nằm ở fn[opp_dir]
+            // Sau swap (is_post_collision = false): f_in nằm ở fn[dir], f_out nằm ở f[opp_dir]
+            double f_in  = is_post_collision ? grid.f[link.dir][n_idx]      : grid.fn[link.dir][n_idx];
+            double f_out = is_post_collision ? grid.fn[link.opp_dir][n_idx] : grid.f[link.opp_dir][n_idx];
+
+            double momentum_transfer = f_in + f_out;
+
             double fx = EX[link.dir] * momentum_transfer;
             double fy = EY[link.dir] * momentum_transfer;
 
             total_Fx += fx;
             total_Fy += fy;
             total_Mz += (link.rx * fy - link.ry * fx);
-
-            // Lực pháp tuyến bề mặt cánh: Fn = Fy * cos(alpha) - Fx * sin(alpha)
-            double fn = fy * cos_a - fx * sin_a;
-            total_Fn += fn;
-            moment_chord += link.x_chord * fn;
         }
 
-        AeroForce result;
-        result.Fx = total_Fx;
-        result.Fy = total_Fy;
-        result.Mz = total_Mz;
-
-        // Quy đổi sang hệ số không thứ nguyên
-        result.Cl = total_Fy / q_dyn_lb;
-        result.Cdp = total_Fx / q_dyn_lb;
-        result.Cd = std::max(result.Cdp, 0.0) + Cd_friction;
-
-        // Vị trí tâm áp suất x_cp (tính từ mép trước LE, gốc quay tại 0.25c)
-        // Với cánh đối xứng khi |Cl| < 0.05, tâm áp suất theo lý thuyết khí động học nằm tại tâm khí động 0.25c
-        if (std::abs(result.Cl) > 0.05)
-        {
-            double xcp = 0.25 + (total_Mz / (total_Fy * chord_lb));
-            result.x_cp = std::max(0.0, std::min(1.0, xcp));
-        }
-        else
-        {
-            result.x_cp = 0.25;
-        }
-
-        return result;
+        return aerodynamic_force(total_Fx,total_Fy,total_Mz,current_alpha_rad,
+                                 chord_lb,q_dyn_lb);
     }
 
 }

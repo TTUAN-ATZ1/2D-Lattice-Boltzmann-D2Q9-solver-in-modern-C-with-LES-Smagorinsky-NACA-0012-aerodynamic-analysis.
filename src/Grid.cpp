@@ -1,11 +1,16 @@
 #include "Grid.hpp"
 #include <cmath>
+#include <limits>
+#include <stdexcept>
 
 namespace lbm
 {
     // khoi tao luoi
-    Grid2D::Grid2D(int nx_, int ny_) : nx(nx_), ny(ny_), size(nx_ * ny_)
+    Grid2D::Grid2D(int nx_, int ny_) : nx(nx_), ny(ny_), size(0)
     {
+        if (nx<3 || ny<3 || static_cast<long long>(nx)*ny>std::numeric_limits<int>::max())
+            throw std::invalid_argument("Grid dimensions must be >=3 and fit an int index");
+        size=nx*ny;
         for (int i = 0; i < Q; i++)
         {
             f[i].resize(size, 0.0);
@@ -14,13 +19,6 @@ namespace lbm
         rho.resize(size, 1.0);
         ux.resize(size, 0.0);
         uy.resize(size, 0.0);
-    }
-    // tinh ham phan bo can bang
-    double Grid2D::compute_feq(int i, double r, double u, double v)
-    {
-        double cu = EX[i] * u + EY[i] * v;
-        double u_2 = u * u + v * v;
-        return WEIGHTS[i] * r * (1.0 + INV_CS2 * cu + INV_2CS4 * (cu * cu) - INV_2CS2 * u_2);
     }
     // khoi tao gia tri dong vao
     void Grid2D::initialize(double u_inf)
@@ -63,8 +61,8 @@ namespace lbm
             }
             else
             {
-                ux[n] = 0.0;
-                uy[n] = 0.0;
+                ux[n] = std::numeric_limits<double>::quiet_NaN();
+                uy[n] = std::numeric_limits<double>::quiet_NaN();
             }
         }
     }

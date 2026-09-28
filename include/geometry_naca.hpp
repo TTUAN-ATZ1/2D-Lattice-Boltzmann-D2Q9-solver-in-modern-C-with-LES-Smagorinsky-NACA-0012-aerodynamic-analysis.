@@ -24,8 +24,6 @@ namespace lbm
 
         std::vector<Point2D> surface_points;
         std::vector<Point2D> raw_points;
-        std::vector<double> ds;
-        std::vector<Point2D> normal;
 
         NACAGeometry(double chord_len, double alpha, double xp, double yp, int num_points = 120);
 
